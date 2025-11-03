@@ -2,3 +2,22 @@
 .Rhistory
 .RData
 .Ruserdata
+/.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Generated videos (export)
+Video_BEFORE_MotionCorrection_*.mp4
+Video_AFTER_MotionCorrection_*.mp4
+
+# Generated analysis exports
+Motion_Shifts_*.csv
+TIC_TimeSeries_*.csv
+ROI_Properties_*.csv
