@@ -13,7 +13,7 @@ from napari._qt.qt_event_loop import get_qapp
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QSlider, QGroupBox, QFileDialog, QMessageBox, QListWidget, QInputDialog, QShortcut, QApplication, QSpacerItem, QFrame,
-    QAbstractItemView, QSplitter
+    QAbstractItemView, QSplitter, QCheckBox
 )
 from PyQt5.QtWidgets import QSizePolicy
 from PyQt5.QtCore import Qt, QTimer, QSize
@@ -25,6 +25,10 @@ from src.core import (
 )
 from src.ui.widgets.tic_plot_widget import TICPlotWidget
 from src.ui.widgets.fit_panel import FitPanel
+try:
+    from src.analysis.models import fit_models
+except Exception:
+    fit_models = None
 from skimage.draw import polygon as sk_polygon
 
 
@@ -94,6 +98,8 @@ class NapariCEUSWindow(QWidget):
         self._roi_master = 'ceus'
         # Dernier point TIC cliqué (label, idx) pour raccourcis clavier
         self._last_tic_target = None  # (label, idx)
+        # Résultats de fit par ROI {label: {model: {params, rss, y_fit}}}
+        self.fit_results = {}
         # Ensure we can receive key events
         try:
             self.setFocusPolicy(Qt.StrongFocus)
@@ -354,6 +360,14 @@ class NapariCEUSWindow(QWidget):
         # Fit panel
         fit_group = QGroupBox("Model Fitting")
         fit_layout = QVBoxLayout()
+        # Option: limiter le fit à l'intervalle sélectionné sur le plot TIC
+        try:
+            self.chk_fit_use_region = QCheckBox("Limiter le fit au sélecteur de temps (TIC)")
+            self.chk_fit_use_region.setChecked(False)
+            self.chk_fit_use_region.toggled.connect(lambda checked: self.tic_plot.enable_region_selector(checked))
+            fit_layout.addWidget(self.chk_fit_use_region)
+        except Exception:
+            pass
         fit_layout.addWidget(self.fit_panel)
         fit_group.setLayout(fit_layout)
         bottom_layout.addWidget(fit_group, stretch=1)
@@ -1629,21 +1643,94 @@ class NapariCEUSWindow(QWidget):
     # =========================================================================
     
     def on_fit_requested(self, params: dict):
-        """Handle fit request from fit panel"""
+        """Fit des modèles pour les ROI sélectionnées, en respectant valid_mask et l'intervalle optionnel."""
         if len(self.roi_tic_data) == 0:
             QMessageBox.warning(self, "Warning", "No TIC data available. Compute TICs first.")
             return
-        
-        # Exemples d'accès aux courbes filtrées (masque valid_mask appliqué)
-        # Ceci prépare le fitting (non implémenté ici)
+
+        if fit_models is None:
+            self.status_label.setText("❌ Module de fit indisponible.")
+            return
+
+        # ROI(s) ciblées: sélection multiple ou fallback dernière TIC cliquée
+        items = getattr(self.roi_info_widget, "selectedItems", lambda: [])()
+        labels = [it.data(Qt.UserRole) for it in items if it.data(Qt.UserRole)]
+        if not labels:
+            if getattr(self, "_last_tic_target", None):
+                labels = [self._last_tic_target[0]]
+            else:
+                self.status_label.setText("Sélectionnez au moins une ROI pour fitter.")
+                return
+
+        # Hints: t0 (flash) si dispo, baseline approx
+        fps = float(self.fps) if getattr(self, "fps", None) else None
+        flash_idx = getattr(self, "flash_idx", None)
+        t0_hint = None
+        if fps is not None and flash_idx is not None:
+            try:
+                t0_hint = float(flash_idx) / fps
+            except Exception:
+                t0_hint = None
+
+        # Option intervalle via sélecteur du plot
+        use_region = getattr(self, "chk_fit_use_region", None)
+        region = None
         try:
-            for label, tic in self.roi_tic_data.items():
-                t = tic['time'][tic['valid_mask']]
-                y = tic['dvi'][tic['valid_mask']]
-                _ = (t, y)  # placeholder pour évit. warning
+            if use_region is not None and use_region.isChecked():
+                region = self.tic_plot.get_region_range()
         except Exception:
-            pass
-        self.status_label.setText("🔬 Fitting models... (not yet implemented)")
+            region = None
+
+        model_colors = {
+            "lognormal": "#e41a1c",
+            "gamma": "#377eb8",
+            "ldrw": "#4daf4a",
+            "fpt": "#984ea3",
+        }
+
+        any_fitted = False
+        for label in labels:
+            tic = self.roi_tic_data.get(label)
+            if not tic:
+                continue
+            t_all = np.asarray(tic["time"])  # type: ignore
+            y_all = np.asarray(tic["dvi"])   # type: ignore
+            mask_valid = np.asarray(tic.get("valid_mask", np.ones_like(y_all, dtype=bool)))
+            if t_all.size == 0 or y_all.size == 0:
+                continue
+
+            mask = mask_valid.copy()
+            if region is not None:
+                t_start, t_end = region
+                mask &= (t_all >= t_start) & (t_all <= t_end)
+
+            t = t_all[mask]
+            y = y_all[mask]
+            if t.size < 5:
+                continue
+
+            C_hint = float(np.percentile(y, 10))
+            try:
+                results = fit_models(t, y, models=("lognormal", "gamma", "ldrw", "fpt"),
+                                     t0_hint=t0_hint, C_hint=C_hint, n_starts=60)
+            except Exception as e:
+                self.status_label.setText(f"Fit échoué pour {label}: {e}")
+                continue
+
+            self.fit_results[label] = results
+            any_fitted = True
+
+            # Superposer les courbes de fit sur la plage t filtrée
+            try:
+                for m, res in results.items():
+                    if not res:
+                        continue
+                    color = model_colors.get(m, "#666")
+                    self.tic_plot.set_fit_curve(label, m, t, res["y_fit"], color=color, width=2.0, dashed=True)
+            except Exception:
+                pass
+
+        self.status_label.setText("✅ Fit terminé" if any_fitted else "ℹ️ Rien à fitter (sélection vide ou insuffisante)")
 
     # =========================================================================
     # TIC ↔ Frame interactions

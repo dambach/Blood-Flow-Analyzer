@@ -20,6 +20,10 @@ class TICPlotWidget(QWidget):
         self.tic_curves = {}
         self.crosshair_line = None
         self._last_clicked_idx_by_label = {}
+        # Courbes de fit (overlays): key=(roi_label, model) -> PlotDataItem
+        self.fit_curves = {}
+        # Sélecteur d'intervalle (LinearRegionItem), masqué par défaut
+        self._region = None
 
         self._create_widgets()
         self._create_layout()
@@ -74,6 +78,18 @@ class TICPlotWidget(QWidget):
         )
         self.plot_widget.addItem(self.crosshair_line)
         self.crosshair_line.setVisible(False)
+        
+        # Sélecteur d'intervalle pour le fit (caché par défaut)
+        try:
+            self._region = pg.LinearRegionItem(values=None, orientation=None, movable=True)
+            self._region.setZValue(800)
+            self._region.setVisible(False)
+            # Style léger
+            self._region.setBrush(pg.mkBrush(100, 100, 255, 40))
+            self._region.setPen(pg.mkPen(100, 100, 255, 120, style=Qt.DashLine))
+            self.plot_widget.addItem(self._region)
+        except Exception:
+            self._region = None
     
     def _create_layout(self):
         """Create layout"""
@@ -242,6 +258,8 @@ class TICPlotWidget(QWidget):
         """Clear all curves"""
         for roi_label in list(self.tic_curves.keys()):
             self.remove_tic_curve(roi_label)
+        # Nettoyer les courbes de fit
+        self.clear_fit_curves()
 
     # --- internal handlers ---
     def _on_scatter_clicked(self, roi_label: str, _plt, points):
@@ -296,3 +314,105 @@ class TICPlotWidget(QWidget):
             self.point_clicked.emit('__plot__', idx)
         except Exception:
             pass
+
+    # ==========================
+    # API Fit overlays & Region
+    # ==========================
+    def set_fit_curve(self, roi_label: str, model: str, t: np.ndarray, y: np.ndarray, color: str = '#000', width: float = 2.0, dashed: bool = True):
+        """Ajoute/MàJ une courbe de fit pour une ROI et un modèle."""
+        key = (roi_label, model)
+        try:
+            pen = pg.mkPen(color=color, width=width, style=Qt.DashLine if dashed else Qt.SolidLine)
+        except Exception:
+            pen = None
+        line = self.fit_curves.get(key)
+        if line is None:
+            try:
+                line = self.plot_widget.plot(t, y, pen=pen, name=f"{roi_label} · {model}")
+                self.fit_curves[key] = line
+            except Exception:
+                return
+        else:
+            try:
+                line.setData(t, y)
+                if pen is not None:
+                    line.setPen(pen)
+            except Exception:
+                pass
+
+    def clear_fit_curves(self, roi_label: str = None):
+        """Supprime toutes les courbes de fit (ou celles d'une ROI)."""
+        if roi_label is None:
+            keys = list(self.fit_curves.keys())
+        else:
+            keys = [k for k in list(self.fit_curves.keys()) if k[0] == roi_label]
+        for k in keys:
+            item = self.fit_curves.get(k)
+            if item is None:
+                continue
+            try:
+                self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+            self.fit_curves.pop(k, None)
+
+    def enable_region_selector(self, enable: bool, default_span_s: float = 5.0):
+        """Affiche/masque le sélecteur d'intervalle. Initialise une plage par défaut si nécessaire."""
+        if self._region is None:
+            return
+        self._region.setVisible(bool(enable))
+        if not enable:
+            return
+        # Init si pas encore défini
+        try:
+            region = self._region.getRegion()
+        except Exception:
+            region = None
+        if not region or any([r is None for r in region]):
+            if not self.tic_curves:
+                return
+            first = list(self.tic_curves.values())[0]
+            t = np.asarray(first.get('t', []), dtype=float)
+            if t.size == 0:
+                return
+            tmin, tmax = float(np.min(t)), float(np.max(t))
+            # Centrage sur le crosshair si visible
+            try:
+                if self.crosshair_line is not None and self.crosshair_line.isVisible():
+                    cx = float(self.crosshair_line.value()) if hasattr(self.crosshair_line, 'value') else float(self.crosshair_line.pos().x())
+                else:
+                    cx = (tmin + tmax) * 0.5
+            except Exception:
+                cx = (tmin + tmax) * 0.5
+            half = max(0.1, default_span_s * 0.5)
+            a = max(tmin, cx - half)
+            b = min(tmax, cx + half)
+            if b <= a:
+                a, b = tmin, min(tmin + default_span_s, tmax)
+            try:
+                self._region.setRegion((a, b))
+            except Exception:
+                pass
+
+    def set_region_range(self, t0: float, t1: float):
+        if self._region is None:
+            return
+        try:
+            a, b = float(min(t0, t1)), float(max(t0, t1))
+            self._region.setRegion((a, b))
+        except Exception:
+            pass
+
+    def get_region_range(self):
+        if self._region is None or not self._region.isVisible():
+            return None
+        try:
+            a, b = self._region.getRegion()
+            if a is None or b is None:
+                return None
+            a, b = float(a), float(b)
+            if np.isfinite(a) and np.isfinite(b) and b > a:
+                return a, b
+        except Exception:
+            return None
+        return None
